@@ -37,6 +37,7 @@ The diagram above shows the production deployment of DAGSTER on EKS. The main ru
   - **System nodes** (`t3.medium`, on-demand): Host the Dagster webserver, daemon, user code deployments, and shared cluster services that must remain continuously available.
   - **Worker nodes** (`t3.medium` / `t3a.medium`, spot instances): Execute Kubernetes job pods for pipeline workloads with scale-to-zero when idle.
 - **Justification**: System components need reliability (on-demand), while batch workloads can handle interruptions (spot = 70% cost savings)
+- **Operational caveat**: Spot-backed workers are appropriate only for idempotent or retry-safe workloads. Production batch capacity should also use diversified instance pools so the autoscaler has multiple placement options when spot capacity is constrained.
 
 **2. Network Architecture:**
 - **VPC**: `10.0.0.0/16` across 2 Availability Zones for high availability
@@ -68,21 +69,23 @@ The diagram above shows the production deployment of DAGSTER on EKS. The main ru
 | Node Group | Instance | Capacity | Count | Justification |
 |---|---|---|---|---|
 | **system** | `t3.medium` (2 vCPU / 4 GiB) | On-Demand | min 2, max 4 | Hosts the Dagster control plane and shared cluster services across both AZs. Two nodes provide AZ redundancy for always-on components such as the daemon, webserver, and monitoring agents. |
-| **workers** | `t3.medium` / `t3a.medium` | Spot | min 0, max 10 | Runs Dagster workload pods launched by the Kubernetes run launcher. Spot capacity cuts compute cost substantially, and scale-to-zero keeps batch capacity off when there is no queued work. |
+| **workers** | `t3.medium` / `t3a.medium` | Spot | min 0, max 10 | Runs Dagster workload pods launched by the Kubernetes run launcher. Spot capacity cuts compute cost substantially, and scale-to-zero keeps batch capacity off when there is no queued work, provided jobs are interruption-tolerant and resource requests are set realistically. |
 
 ### Scaling Strategies for High Traffic and Long-running Workflows
 
 The repository already implements the core scaling split for Dagster on EKS:
 
 - **System node group** scales the always-on control plane from `2` to `4` nodes.
-- **Worker node group** scales execution capacity from `0` to `10` nodes through the EKS Cluster Autoscaler.
+- **Worker node group** scales execution capacity from `0` to `10` nodes through a node autoscaler such as EKS Cluster Autoscaler. For this design, a managed node-group autoscaler is a reasonable fit because worker capacity is pre-bounded and operationally simple; Karpenter is also a valid alternative if faster, more flexible auto-provisioning is needed later.
 - **Dagster webserver** runs with `2` replicas to absorb concurrent UI and GraphQL traffic.
 - **Run pods** are isolated by the `K8sRunLauncher`, so heavy workflows scale as separate Kubernetes jobs instead of overloading the webserver or daemon.
+- **Executor behavior still matters**: in Dagster, the run launcher determines where a run executes, while the executor determines how steps execute within that run. `K8sRunLauncher` gives per-run isolation; it does not by itself provide step-per-pod fan-out for a single run.
+- **Resource requests are the scaling contract**: Kubernetes node autoscalers react to pending pods and their declared CPU and memory requests, not the pods' actual runtime usage. Accurate requests and limits are therefore required for predictable Dagster job scaling.
 
 | Scenario | Primary bottleneck | Scaling strategy in this repo | Operational response |
 |---|---|---|---|
-| High Dagit / GraphQL traffic | Webserver pods or system nodes | Keep `dagsterWebserver.replicaCount=2`; system node group can expand from `2` to `4` nodes | If UI latency rises or webserver pods restart, first add system-node headroom, then increase webserver replicas in Helm values if sustained traffic justifies it |
-| Spike in pipeline submissions | Worker node pool | Cluster Autoscaler expands the worker node group from `0` toward `10` nodes as Dagster run pods queue up | Watch pending pods, queue depth, and node capacity; raise `worker_node_max` or move to larger worker instance types if the queue persists |
+| High Dagit / GraphQL traffic | Webserver pods or system nodes | Keep `dagsterWebserver.replicaCount=2`; system node group can expand from `2` to `4` nodes | If UI latency rises or webserver pods restart, first add system-node headroom, then increase webserver replicas in Helm values if sustained traffic justifies it. If traffic becomes materially bursty, consider HPA as a follow-on optimisation rather than the first lever. |
+| Spike in pipeline submissions | Worker node pool | The node autoscaler expands the worker node group from `0` toward `10` nodes as Dagster run pods queue up | Watch pending pods, queue depth, and node capacity; raise `worker_node_max` or move to larger worker instance types if the queue persists. Confirm first that pod requests are realistic, otherwise autoscaling decisions will be misleading. |
 | Long-running or memory-heavy workflows | Individual run pods | Each Dagster run executes in its own Kubernetes pod with explicit CPU and memory requests and limits | Increase run-pod resources in `helm/dagster/values.yaml` for CPU-bound or memory-bound jobs before scaling the whole cluster indiscriminately |
 | Monitoring / control-plane pressure during incidents | Shared system services | System workloads are pinned to the system node group so monitoring and Dagster control-plane services do not compete with batch jobs | Keep monitoring, daemon, and webserver on system nodes; avoid scheduling workload pods there during peak execution windows |
 
@@ -92,6 +95,7 @@ The repository already implements the core scaling split for Dagster on EKS:
 2. Scale **webserver replicas or system nodes** when the bottleneck is operator traffic, GraphQL responsiveness, or control-plane stability.
 3. Scale **run-pod resources** when a small number of workflows are slow because they are CPU-bound, memory-bound, or repeatedly OOM-killed.
 4. Scale **instance types** rather than only node counts when workload characteristics change materially, such as heavier geospatial transforms or larger ML batches.
+5. Switch executor strategy if you need **step-level parallelism inside a single run**. `K8sRunLauncher` improves isolation and run concurrency, but it is not the same thing as executing each step in a separate Kubernetes pod.
 
 ### VPC Design
 
@@ -527,9 +531,10 @@ Prometheus-based alerting is strong for infrastructure and service health, but i
 ### Why These Instance Types and Scaling Settings
 
 - **System nodes** use on-demand capacity because the Dagster control plane, ingress path, and monitoring agents must remain available.
-- **Worker nodes** use spot capacity because data-processing jobs are interruptible and Dagster can recover safely through retries and resubmission.
-- **Scale-to-zero workers** minimise cost when no runs are queued, while the autoscaler expands the worker pool only when the run launcher creates demand.
+- **Worker nodes** use spot capacity because data-processing jobs are interruptible and Dagster can recover safely through retries and resubmission. This assumes jobs are idempotent, tolerate restarts, and can safely resume after EC2 spot interruption or pod eviction.
+- **Scale-to-zero workers** minimise cost when no runs are queued, while the autoscaler expands the worker pool only when the run launcher creates demand. This only works well when run pods have realistic CPU and memory requests because node autoscalers provision against requested resources, not observed usage.
 - **Medium-sized nodes** strike a practical balance between pod density, memory headroom, and cost for application pods, system DaemonSets, and monitoring components.
+- **Cluster Autoscaler is a conservative choice** for this topology because it works well with pre-defined managed node groups. If future workloads need more dynamic instance selection, faster provisioning, or broader spot diversification, Karpenter is the main evolution path rather than a fundamentally different architecture.
 
 ### Why AWS Load Balancer Controller and ALB
 
