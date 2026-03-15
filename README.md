@@ -2,7 +2,6 @@
 
 **Production-ready deployment of [Dagster](https://dagster.io) on Amazon EKS** for geospatial data processing and ML pipelines. This solution implements Infrastructure as Code (Terraform), GitOps CI/CD (GitHub Actions), and automated alerting for data workflows.
 
-**Repository**: https://github.com/ashiq-ali/AWS-DevOps
 
 ## Table of Contents
 
