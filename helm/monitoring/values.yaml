@@ -1,0 +1,355 @@
+# kube-prometheus-stack Helm values
+# Chart: prometheus-community/kube-prometheus-stack v58.x
+# Deployed to namespace: monitoring
+
+############################
+# Admission Webhooks
+############################
+# Disable admission webhook jobs — they require cert-manager or a working
+# webhook server before install, causing pre-install hook timeouts on fresh
+# clusters. POC clusters don't need webhook validation.
+prometheusOperator:
+  admissionWebhooks:
+    enabled: false
+    patch:
+      enabled: false
+  tls:
+    enabled: false
+
+############################
+# Prometheus
+############################
+prometheus:
+  prometheusSpec:
+    # 30-day retention — sufficient for trend analysis; use Thanos/Cortex for long-term
+    retention: 30d
+    retentionSize: "50GB"
+
+    # POC: no persistence — data lost on pod restart.
+    # For production: enable storageSpec with storageClassName: gp3
+    storageSpec: {}
+
+    resources:
+      requests:
+        cpu: "200m"
+        memory: "512Mi"
+      limits:
+        cpu: "1000m"
+        memory: "2Gi"
+
+    tolerations:
+      - key: "role"
+        operator: "Equal"
+        value: "system"
+        effect: "NoSchedule"
+
+    nodeSelector:
+      role: "system"
+
+    # Discover all ServiceMonitors and PodMonitors across all namespaces
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+    ruleSelectorNilUsesHelmValues: false
+
+    # Scrape dagster namespace explicitly
+    additionalScrapeConfigs:
+      - job_name: "dagster"
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names: ["dagster"]
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+            action: keep
+            regex: "true"
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+            action: replace
+            target_label: __metrics_path__
+            regex: (.+)
+          - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+            action: replace
+            regex: ([^:]+)(?::\d+)?;(\d+)
+            replacement: $1:$2
+            target_label: __address__
+          - source_labels: [__meta_kubernetes_namespace]
+            action: replace
+            target_label: kubernetes_namespace
+          - source_labels: [__meta_kubernetes_pod_name]
+            action: replace
+            target_label: kubernetes_pod_name
+          - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_name]
+            action: replace
+            target_label: app
+
+############################
+# Alertmanager
+############################
+alertmanager:
+  alertmanagerSpec:
+    tolerations:
+      - key: "role"
+        operator: "Equal"
+        value: "system"
+        effect: "NoSchedule"
+    nodeSelector:
+      role: "system"
+
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "128Mi"
+      limits:
+        cpu: "200m"
+        memory: "256Mi"
+
+  config:
+    global:
+      resolve_timeout: 5m
+      # SMTP configuration for email alerts
+      smtp_smarthost: "smtp.amazonaws.com:587"
+      smtp_from: "alerts@hydrosat.com"
+      smtp_require_tls: true
+
+    route:
+      group_by: ["alertname", "job", "dagster_job_name"]
+      group_wait: 30s
+      group_interval: 5m
+      repeat_interval: 4h
+      receiver: "slack-oncall"
+
+      routes:
+        # Critical: Slack with short repeat
+        - match:
+            severity: critical
+          receiver: "slack-oncall"
+          repeat_interval: 30m
+
+        # Warning: Slack only
+        - match:
+            severity: warning
+          receiver: "slack-oncall"
+          repeat_interval: 2h
+
+        # Dagster job failures: Slack alert
+        - match:
+            alertname: DagsterJobFailed
+          receiver: "slack-oncall"
+          repeat_interval: 1h
+
+        # Dagster daemon unhealthy: Slack alert
+        - match:
+            alertname: DagsterDaemonUnhealthy
+          receiver: "slack-oncall"
+          repeat_interval: 15m
+
+    receivers:
+      - name: "slack-oncall"
+        slack_configs:
+          - api_url: "PLACEHOLDER_INJECTED_BY_TERRAFORM"
+            channel: "#dagster-alerts"
+            username: "Dagster AlertBot"
+            icon_emoji: ":fire:"
+            send_resolved: true
+            title: |-
+              [{{ .Status | toUpper }}{{ if eq .Status "firing" }}:{{ .Alerts.Firing | len }}{{ end }}] {{ .CommonLabels.alertname }}
+            text: >-
+              {{ range .Alerts }}
+                *Alert:* {{ .Annotations.summary }}
+                *Description:* {{ .Annotations.description }}
+                *Severity:* {{ .Labels.severity }}
+                *Job:* {{ .Labels.dagster_job_name }}
+                *Namespace:* {{ .Labels.namespace }}
+                *Started:* {{ .StartsAt | humanizeTimestamp }}
+              {{ end }}
+
+      - name: "null"  # Silences matched alerts
+
+    inhibit_rules:
+      # If critical fires, suppress warning for the same alertname
+      - source_match:
+          severity: "critical"
+        target_match:
+          severity: "warning"
+        equal: ["alertname", "namespace"]
+
+############################
+# Grafana
+############################
+grafana:
+  enabled: true
+  adminPassword: "change-me-in-production"  # Use Kubernetes secret in prod
+
+  tolerations:
+    - key: "role"
+      operator: "Equal"
+      value: "system"
+      effect: "NoSchedule"
+
+  nodeSelector:
+    role: "system"
+
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "256Mi"
+    limits:
+      cpu: "500m"
+      memory: "512Mi"
+
+  persistence:
+    enabled: false  # POC: use emptyDir. Enable with storageClassName: gp3 for prod.
+
+  ingress:
+    enabled: true
+    ingressClassName: "alb"
+    annotations:
+      alb.ingress.kubernetes.io/scheme: internet-facing
+      alb.ingress.kubernetes.io/target-type: ip
+      alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}, {"HTTPS": 443}]'
+    hosts:
+      - "grafana.hydrosat.internal"  # Replace with real domain
+    path: /
+
+  # Pre-load Dagster dashboard from ConfigMap
+  dashboardProviders:
+    dashboardproviders.yaml:
+      apiVersion: 1
+      providers:
+        - name: "dagster"
+          orgId: 1
+          folder: "Dagster"
+          type: file
+          disableDeletion: false
+          editable: true
+          options:
+            path: /var/lib/grafana/dashboards/dagster
+
+  dashboardsConfigMaps:
+    dagster: "dagster-grafana-dashboard"
+
+  # Data sources
+  additionalDataSources:
+    - name: Prometheus
+      type: prometheus
+      url: http://kube-prometheus-stack-prometheus.monitoring:9090
+      access: proxy
+      isDefault: true
+
+############################
+# kube-state-metrics
+############################
+kube-state-metrics:
+  tolerations:
+    - key: "role"
+      operator: "Equal"
+      value: "system"
+      effect: "NoSchedule"
+  nodeSelector:
+    role: "system"
+
+############################
+# node-exporter
+############################
+prometheus-node-exporter:
+  # DaemonSet — runs on ALL nodes including workers
+  tolerations:
+    - operator: "Exists"
+
+############################
+# Prometheus Rules — Dagster-specific alerts
+############################
+additionalPrometheusRulesMap:
+  dagster-rules:
+    groups:
+      - name: dagster.jobs
+        interval: 60s
+        rules:
+          # ── Alert: Dagster job failure ────────────────────────────────────
+          - alert: DagsterJobFailed
+            expr: |
+              increase(dagster_run_failure_total[5m]) > 0
+            for: 0m   # Immediate — job failures need instant attention
+            labels:
+              severity: critical
+              team: data-platform
+            annotations:
+              summary: "Dagster job failed"
+              description: "A Dagster job has failed in the last 5 minutes. Run ID: {{ $labels.run_id }}, Job: {{ $labels.job_name }}"
+              runbook: "https://wiki.hydrosat.com/runbooks/dagster-job-failure"
+              dashboard: "https://grafana.hydrosat.internal/d/dagster-overview"
+
+          # ── Alert: Dagster job queue depth ───────────────────────────────
+          - alert: DagsterHighQueueDepth
+            expr: |
+              dagster_queued_runs_total > 20
+            for: 10m
+            labels:
+              severity: warning
+              team: data-platform
+            annotations:
+              summary: "Dagster run queue is deep"
+              description: "{{ $value }} runs queued for >10 minutes — cluster autoscaler may be lagging."
+
+          # ── Alert: Dagster daemon not heartbeating ────────────────────────
+          - alert: DagsterDaemonUnhealthy
+            expr: |
+              time() - dagster_daemon_heartbeat_timestamp_seconds > 300
+            for: 2m
+            labels:
+              severity: critical
+              team: data-platform
+            annotations:
+              summary: "Dagster daemon is unhealthy"
+              description: "Dagster daemon has not sent a heartbeat for >5 minutes. Schedules and sensors will not fire."
+              runbook: "https://wiki.hydrosat.com/runbooks/dagster-daemon-unhealthy"
+
+          # ── Alert: Long-running job ───────────────────────────────────────
+          - alert: DagsterJobRunningTooLong
+            expr: |
+              (time() - dagster_run_start_timestamp_seconds) > 3600
+            for: 5m
+            labels:
+              severity: warning
+              team: data-platform
+            annotations:
+              summary: "Dagster job running for >1 hour"
+              description: "Job {{ $labels.job_name }} has been running for {{ $value | humanizeDuration }}. Check for infinite loops or stalled resources."
+
+      - name: dagster.infrastructure
+        interval: 60s
+        rules:
+          # ── Alert: Dagster webserver pod not ready ────────────────────────
+          - alert: DagsterWebserverDown
+            expr: |
+              kube_deployment_status_replicas_ready{deployment="dagster-dagster-webserver", namespace="dagster"} == 0
+            for: 2m
+            labels:
+              severity: critical
+              team: data-platform
+            annotations:
+              summary: "Dagster webserver (Dagit) is down"
+              description: "All Dagster webserver replicas are unavailable. The UI and GraphQL API are unreachable."
+
+          # ── Alert: RDS connections near limit ────────────────────────────
+          - alert: RDSConnectionsHigh
+            expr: |
+              aws_rds_database_connections_average > 80
+            for: 5m
+            labels:
+              severity: warning
+              team: data-platform
+            annotations:
+              summary: "RDS connection count is high"
+              description: "RDS has {{ $value }} connections. Consider connection pooling with PgBouncer."
+
+          # ── Alert: Worker pod OOMKilled ───────────────────────────────────
+          - alert: DagsterWorkerOOMKilled
+            expr: |
+              kube_pod_container_status_last_terminated_reason{reason="OOMKilled", namespace="dagster"} == 1
+            for: 0m
+            labels:
+              severity: warning
+              team: data-platform
+            annotations:
+              summary: "Dagster worker pod was OOM-killed"
+              description: "Pod {{ $labels.pod }} container {{ $labels.container }} was OOM-killed. Increase memory limits or optimize the job."

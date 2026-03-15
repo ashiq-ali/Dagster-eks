@@ -1,0 +1,161 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# CI: Terraform Plan
+#
+# Runs on every PR that touches terraform/ or helm/ files.
+# Posts a plan diff as a PR comment so reviewers can see infra changes.
+# Uses GitHub OIDC → AWS (no long-lived credentials stored in secrets).
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: "CI — Terraform Plan"
+
+on:
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - "terraform/**"
+      - "helm/**"
+      - ".github/workflows/ci-terraform.yml"
+
+permissions:
+  id-token: write       # Required for OIDC token exchange
+  contents: read
+  pull-requests: write  # Required to post plan as a PR comment
+
+env:
+  TF_VERSION: "1.7.5"
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  TF_IN_AUTOMATION: "true"
+  TF_CLI_ARGS: "-no-color"
+
+jobs:
+  terraform-plan:
+    name: Terraform Plan
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: terraform
+
+    steps:
+      # ── Checkout ────────────────────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── AWS OIDC auth — no stored credentials ───────────────────────────────
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: github-actions-tf-plan-${{ github.run_id }}
+
+      # ── Terraform setup ─────────────────────────────────────────────────────
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: true   # Enables output capture for PR comment
+
+      # ── Format check ────────────────────────────────────────────────────────
+      - name: Terraform Format Check
+        id: fmt
+        run: terraform fmt -check -recursive
+        continue-on-error: true
+
+      # ── Init ────────────────────────────────────────────────────────────────
+      - name: Terraform Init
+        id: init
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=dagster-platform/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}" \
+            -backend-config="dynamodb_table=hydrosat-terraform-locks"
+
+      # ── Validate ────────────────────────────────────────────────────────────
+      - name: Terraform Validate
+        id: validate
+        run: terraform validate
+
+      # ── Plan ────────────────────────────────────────────────────────────────
+      - name: Terraform Plan
+        id: plan
+        run: |
+          terraform plan \
+            -var="aws_region=${{ env.AWS_REGION }}" \
+            -var="slack_webhook_url=${{ secrets.SLACK_WEBHOOK_URL }}" \
+            -out=tfplan \
+            -detailed-exitcode
+        continue-on-error: true   # Exit 2 = changes present — not a failure
+
+      # ── Post plan as PR comment ─────────────────────────────────────────────
+      - name: Post Plan to PR
+        uses: actions/github-script@v7
+        if: github.event_name == 'pull_request'
+        env:
+          PLAN_STDOUT: ${{ steps.plan.outputs.stdout }}
+          PLAN_STDERR: ${{ steps.plan.outputs.stderr }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const botComment = comments.find(comment =>
+              comment.user.type === 'Bot' &&
+              comment.body.includes('Terraform Plan')
+            );
+
+            const fmtOutcome  = '${{ steps.fmt.outcome }}';
+            const initOutcome = '${{ steps.init.outcome }}';
+            const planOutcome = '${{ steps.plan.outcome }}';
+            const planExitCode = '${{ steps.plan.outputs.exitcode }}';
+
+            const statusIcon = (outcome) =>
+              outcome === 'success' ? '✅' : outcome === 'failure' ? '❌' : '⚠️';
+
+            const planOutput = process.env.PLAN_STDOUT || process.env.PLAN_STDERR || 'No plan output';
+            const truncated  = planOutput.length > 60000
+              ? planOutput.substring(0, 60000) + '\n\n... (truncated — see Actions logs for full plan)'
+              : planOutput;
+
+            const body = `## Terraform Plan
+
+            | Step       | Result |
+            |------------|--------|
+            | fmt check  | ${statusIcon(fmtOutcome)} ${fmtOutcome} |
+            | init       | ${statusIcon(initOutcome)} ${initOutcome} |
+            | plan       | ${statusIcon(planOutcome)} ${planOutcome} (exit ${planExitCode}) |
+
+            <details><summary>📋 Plan output</summary>
+
+            \`\`\`terraform
+            ${truncated}
+            \`\`\`
+
+            </details>
+
+            *Workflow: \`${{ github.workflow }}\` | Run: [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})*`;
+
+            if (botComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+
+      # ── Fail if plan errored (exit 1) ────────────────────────────────────────
+      - name: Check Plan Status
+        if: steps.plan.outputs.exitcode == '1'
+        run: exit 1

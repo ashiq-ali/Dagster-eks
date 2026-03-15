@@ -1,0 +1,25 @@
+# Keep the Docker build context lean
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+.eggs/
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+tests/
+*.log
+dagster_home/
+.dagster/
+docker-compose.yml
+prometheus-local.yml
+.dockerignore

@@ -1,0 +1,13 @@
+# Dagster workspace — defines where to find code locations.
+# Used by `dagster dev` (local) and the Dagster webserver when running
+# outside of Kubernetes (e.g. local Docker Compose).
+#
+# In Kubernetes the Helm chart creates gRPC code servers automatically;
+# this file is for local development only.
+
+load_from:
+  - python_file:
+      relative_path: pipeline/__init__.py
+      attribute: defs
+      working_directory: .
+      location_name: hydrosat-pipeline

@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]
+ignore = [
+    "E501",   # line too long — enforced by formatter
+    "B008",   # do not perform function calls in argument defaults (Dagster pattern)
+    "SIM117", # combine nested with statements — reduces readability for context managers
+]
+exclude = ["tests/", ".venv/", "build/"]
+
+[tool.ruff.isort]
+known-first-party = ["pipeline"]
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+no_strict_optional = true
+warn_unused_ignores = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short -p no:warnings"
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::UserWarning",
+]
+
+[tool.coverage.run]
+source = ["pipeline"]
+omit = ["tests/*", "setup.py"]
+
+[tool.coverage.report]
+fail_under = 70
+show_missing = true

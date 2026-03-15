@@ -1,0 +1,95 @@
+# Dagster instance configuration (DAGSTER_HOME/dagster.yaml)
+# This file is used when running Dagster locally (dagster dev).
+# In Kubernetes, instance config is managed by the Helm chart via dagster-instance ConfigMap.
+
+# ── Run storage ───────────────────────────────────────────────────────────────
+# PostgreSQL run storage — reads connection from env var.
+# Set DAGSTER_POSTGRES_DB_CONN_STR or individual DAGSTER_POSTGRES_* vars.
+run_storage:
+  module: dagster_postgres.run_storage
+  class: PostgresRunStorage
+  config:
+    postgres_db:
+      username:
+        env: DAGSTER_POSTGRES_USER
+      password:
+        env: DAGSTER_POSTGRES_PASSWORD
+      hostname:
+        env: DAGSTER_POSTGRES_HOST
+      db_name:
+        env: DAGSTER_POSTGRES_DB
+      port:
+        env: DAGSTER_POSTGRES_PORT
+
+# ── Event log storage ─────────────────────────────────────────────────────────
+event_log_storage:
+  module: dagster_postgres.event_log
+  class: PostgresEventLogStorage
+  config:
+    postgres_db:
+      username:
+        env: DAGSTER_POSTGRES_USER
+      password:
+        env: DAGSTER_POSTGRES_PASSWORD
+      hostname:
+        env: DAGSTER_POSTGRES_HOST
+      db_name:
+        env: DAGSTER_POSTGRES_DB
+      port:
+        env: DAGSTER_POSTGRES_PORT
+
+# ── Schedule storage ──────────────────────────────────────────────────────────
+schedule_storage:
+  module: dagster_postgres.schedule_storage
+  class: PostgresScheduleStorage
+  config:
+    postgres_db:
+      username:
+        env: DAGSTER_POSTGRES_USER
+      password:
+        env: DAGSTER_POSTGRES_PASSWORD
+      hostname:
+        env: DAGSTER_POSTGRES_HOST
+      db_name:
+        env: DAGSTER_POSTGRES_DB
+      port:
+        env: DAGSTER_POSTGRES_PORT
+
+# ── Compute log storage (S3) ──────────────────────────────────────────────────
+# Stores stdout/stderr from each op execution. Accessible in Dagit logs panel.
+compute_logs:
+  module: dagster_aws.s3.compute_log_manager
+  class: S3ComputeLogManager
+  config:
+    bucket:
+      env: DAGSTER_S3_LOG_BUCKET       # Injected by Helm via Terraform output
+    prefix: "compute-logs"             # Matches helm/dagster/values.yaml prefix
+    region:
+      env: AWS_REGION
+
+# ── Run coordinator ───────────────────────────────────────────────────────────
+# QueuedRunCoordinator enables run concurrency limits — prevents thundering-herd
+# when many runs are triggered simultaneously (e.g. on S3 sensor batch).
+run_coordinator:
+  module: dagster.core.run_coordinator
+  class: QueuedRunCoordinator
+  config:
+    max_concurrent_runs: 10       # Hard limit — protects cluster from overload
+    tag_concurrency_limits:
+      - key: "pipeline"
+        value: "satellite"
+        limit: 5                  # Max 5 concurrent satellite pipeline runs
+      - key: "pipeline"
+        value: "ml-inference"
+        limit: 3
+
+# ── Run launcher ──────────────────────────────────────────────────────────────
+# In production (Kubernetes) this is overridden by the Helm chart to use
+# K8sRunLauncher. Kept as DefaultRunLauncher for local dev.
+run_launcher:
+  module: dagster.core.launcher
+  class: DefaultRunLauncher
+
+# ── Telemetry ─────────────────────────────────────────────────────────────────
+telemetry:
+  enabled: false

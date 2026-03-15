@@ -1,0 +1,147 @@
+# Local development stack — mirrors the EKS/RDS production setup.
+# Does NOT require AWS credentials. PostgreSQL runs in a container.
+#
+# Usage:
+#   docker compose up -d
+#   open http://localhost:3000
+#
+# Stop:
+#   docker compose down -v
+
+version: "3.9"
+
+x-dagster-env: &dagster-env
+  DAGSTER_POSTGRES_HOST: postgres
+  DAGSTER_POSTGRES_PORT: "5432"
+  DAGSTER_POSTGRES_DB: dagster
+  DAGSTER_POSTGRES_USER: dagster
+  DAGSTER_POSTGRES_PASSWORD: dagster_dev_password
+  DAGSTER_HOME: /opt/dagster/dagster_home
+  HYDROSAT_S3_BUCKET: hydrosat-data-dev   # mocked — override with localstack endpoint
+  AWS_REGION: us-east-1
+  # For local runs without real S3, disable S3 compute log manager:
+  DAGSTER_DISABLE_S3_COMPUTE_LOG_MANAGER: "true"
+
+services:
+  # ── PostgreSQL ──────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: dagster
+      POSTGRES_USER: dagster
+      POSTGRES_PASSWORD: dagster_dev_password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dagster -d dagster"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    ports:
+      - "5432:5432"
+
+  # ── Dagster code server (gRPC) ───────────────────────────────────────────────
+  dagster_code:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    image: hydrosat/dagster-pipeline:dev
+    restart: unless-stopped
+    environment:
+      <<: *dagster-env
+    volumes:
+      - dagster_home:/opt/dagster/dagster_home
+      - ./pipeline:/opt/dagster/app/pipeline   # hot-reload in dev
+    ports:
+      - "3030:3030"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import grpc; ch=grpc.insecure_channel('localhost:3030'); grpc.channel_ready_future(ch).result(timeout=5)"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # ── Dagster webserver (Dagit) ────────────────────────────────────────────────
+  dagster_webserver:
+    image: ghcr.io/dagster-io/dagster:1.7.4
+    entrypoint:
+      - dagster-webserver
+      - -h
+      - "0.0.0.0"
+      - -p
+      - "3000"
+      - -w
+      - /opt/dagster/app/workspace.yaml
+    restart: unless-stopped
+    environment:
+      <<: *dagster-env
+    volumes:
+      - dagster_home:/opt/dagster/dagster_home
+      - ./workspace.yaml:/opt/dagster/app/workspace.yaml:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      dagster_code:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
+  # ── Dagster daemon (schedules + sensors + run queue) ─────────────────────────
+  dagster_daemon:
+    image: ghcr.io/dagster-io/dagster:1.7.4
+    entrypoint:
+      - dagster-daemon
+      - run
+    restart: unless-stopped
+    environment:
+      <<: *dagster-env
+    volumes:
+      - dagster_home:/opt/dagster/dagster_home
+      - ./workspace.yaml:/opt/dagster/app/workspace.yaml:ro
+    depends_on:
+      dagster_code:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
+  # ── Prometheus ───────────────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    restart: unless-stopped
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.console.libraries=/usr/share/prometheus/console_libraries"
+      - "--web.console.templates=/usr/share/prometheus/consoles"
+    volumes:
+      - ./prometheus-local.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+
+  # ── Grafana ──────────────────────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:10.3.3
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "3001:3000"
+    depends_on:
+      - prometheus
+
+volumes:
+  postgres_data:
+  dagster_home:
+  prometheus_data:
+  grafana_data:

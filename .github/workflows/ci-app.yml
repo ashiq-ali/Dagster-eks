@@ -1,0 +1,132 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# CI: Application — Lint, Test, Docker Build (no push)
+#
+# Runs on every PR touching dagster/ code.
+# Validates the pipeline code, runs unit tests, and builds the Docker image
+# to catch build failures before merge.
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: "CI — Application"
+
+on:
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - "dagster/**"
+      - ".github/workflows/ci-app.yml"
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+jobs:
+  lint-and-test:
+    name: Lint & Unit Tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: dagster
+
+    strategy:
+      matrix:
+        python-version: ["3.11"]
+
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_DB: dagster_test
+          POSTGRES_USER: dagster
+          POSTGRES_PASSWORD: test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U dagster -d dagster_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -e ".[dev]"
+          pip install ruff mypy pytest-cov
+
+      - name: Lint with ruff
+        run: ruff check pipeline/
+
+      - name: Type check with mypy
+        run: mypy pipeline/ --ignore-missing-imports --no-strict-optional
+        continue-on-error: true   # Warn but don't block on type issues yet
+
+      - name: Run unit tests
+        run: |
+          pytest tests/ \
+            --cov=pipeline \
+            --cov-report=xml \
+            --cov-report=term-missing \
+            -v \
+            --tb=short
+        env:
+          DAGSTER_POSTGRES_HOST: localhost
+          DAGSTER_POSTGRES_DB: dagster_test
+          DAGSTER_POSTGRES_USER: dagster
+          DAGSTER_POSTGRES_PASSWORD: test
+
+      - name: Upload coverage report
+        uses: codecov/codecov-action@v4
+        with:
+          file: dagster/coverage.xml
+          flags: dagster-pipeline
+        continue-on-error: true
+
+  docker-build:
+    name: Docker Build (no push)
+    runs-on: ubuntu-latest
+    needs: lint-and-test
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Build only — no push on PRs. Validates Dockerfile correctness.
+      - name: Build Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: dagster
+          file: dagster/Dockerfile
+          platforms: linux/amd64
+          push: false
+          tags: hydrosat/dagster-pipeline:pr-${{ github.event.pull_request.number }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Scan image for vulnerabilities (Trivy)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: hydrosat/dagster-pipeline:pr-${{ github.event.pull_request.number }}
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH
+          exit-code: "0"   # Warn only — don't block on scan results
+        continue-on-error: true
+
+      - name: Upload Trivy SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+        continue-on-error: true

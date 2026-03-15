@@ -1,0 +1,561 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# CD: Deploy Application (Docker → ECR → Helm upgrade)
+#
+# Triggers:
+#   - Push to main touching dagster/ or helm/dagster/ → full build + deploy
+#   - workflow_dispatch → manual re-deploy with optional image tag override
+#   - workflow_call → called by deploy-infra after infrastructure changes
+#
+# Flow:
+#   build-push → deploy-dagster → deploy-monitoring → smoke-test
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: "CD — Deploy Application"
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "dagster/**"
+      - "helm/dagster/**"
+      - "helm/monitoring/**"
+      - "kubernetes/**"
+      - ".github/workflows/deploy-app.yml"
+
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Docker image tag to deploy (leave blank for new build)"
+        required: false
+        default: ""
+      environment:
+        description: "Target environment"
+        required: true
+        default: "prod"
+        type: choice
+        options: [prod, staging, dev]
+      skip_build:
+        description: "Skip Docker build (deploy existing tag)"
+        required: false
+        default: false
+        type: boolean
+
+  # Called by deploy-infra after a fresh cluster is provisioned
+  workflow_call:
+    inputs:
+      environment:
+        type: string
+        required: false
+        default: "prod"
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
+  ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+  CLUSTER_NAME: "hydrosat-dagster"
+  ENVIRONMENT: ${{ inputs.environment || github.event.inputs.environment || 'prod' }}
+
+jobs:
+  # ── Job 1: Build & push Docker image ─────────────────────────────────────
+  build-push:
+    name: Build & Push Docker Image
+    runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.skip_build != 'true' }}
+    outputs:
+      image_tag: ${{ steps.meta.outputs.version }}
+      image_full: ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ steps.meta.outputs.version }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: github-actions-build-${{ github.run_id }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Generate semantic tags: sha-<short>, branch name, latest (on main)
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}
+          tags: |
+            type=sha,prefix=sha-,format=short
+            type=ref,event=branch
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=${{ github.event.inputs.image_tag }},enable=${{ github.event.inputs.image_tag != '' }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v5
+        with:
+          context: dagster
+          file: dagster/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            BUILD_DATE=${{ github.event.repository.updated_at }}
+            GIT_COMMIT=${{ github.sha }}
+            GIT_REF=${{ github.ref_name }}
+
+      - name: Run Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ steps.meta.outputs.version }}
+          format: table
+          severity: CRITICAL
+          exit-code: "1"   # Block deployment on CRITICAL CVEs
+        continue-on-error: true   # Remove continue-on-error in strict mode
+
+  # ── Job 2: Deploy Dagster via Helm ────────────────────────────────────────
+  deploy-dagster:
+    name: Deploy Dagster (Helm)
+    runs-on: ubuntu-latest
+    needs: build-push
+    if: always() && (needs.build-push.result == 'success' || needs.build-push.result == 'skipped')
+    environment: ${{ (github.event_name == 'push' || github.event.inputs.environment == 'prod' || inputs.environment == 'prod') && 'production' || github.event.inputs.environment || inputs.environment || 'dev' }}
+    concurrency:
+      group: deploy-dagster-${{ inputs.environment || github.event.inputs.environment || 'prod' }}
+      cancel-in-progress: false
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: github-actions-deploy-dagster-${{ github.run_id }}
+
+      - name: Grant EKS access and update kubeconfig
+        run: |
+          ROLE_ARN="${{ secrets.AWS_ROLE_ARN }}"
+          CLUSTER="${{ env.CLUSTER_NAME }}"
+          REGION="${{ env.AWS_REGION }}"
+
+          CURRENT_MODE=$(aws eks describe-cluster --name "${CLUSTER}" \
+            --region "${REGION}" \
+            --query 'cluster.accessConfig.authenticationMode' --output text)
+          if [[ "${CURRENT_MODE}" == "CONFIG_MAP" ]]; then
+            aws eks update-cluster-config --name "${CLUSTER}" \
+              --region "${REGION}" \
+              --access-config authenticationMode=API_AND_CONFIG_MAP
+            sleep 30
+          fi
+
+          aws eks create-access-entry --cluster-name "${CLUSTER}" \
+            --principal-arn "${ROLE_ARN}" --region "${REGION}" 2>/dev/null || true
+          aws eks associate-access-policy --cluster-name "${CLUSTER}" \
+            --principal-arn "${ROLE_ARN}" \
+            --policy-arn arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy \
+            --access-scope type=cluster --region "${REGION}" 2>/dev/null || true
+
+          aws eks update-kubeconfig --region "${REGION}" --name "${CLUSTER}"
+
+      # Fetch infra values created by Terraform — needed for Helm set{} overrides.
+      # These are deterministic names set by Terraform resources in main.tf.
+      - name: Fetch infra values
+        id: infra-values
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          ENV="${{ env.ENVIRONMENT }}"
+
+          IRSA_ROLE_ARN=$(aws iam get-role \
+            --role-name "hydrosat-dagster-dagster-sa-role" \
+            --query 'Role.Arn' --output text 2>/dev/null || echo "")
+
+          S3_BUCKET="hydrosat-dagster-logs-${ENV}-${ACCOUNT_ID}"
+
+          SNS_TOPIC_ARN=$(aws sns list-topics \
+            --query "Topics[?contains(TopicArn,'hydrosat-dagster-alerts')].TopicArn | [0]" \
+            --output text 2>/dev/null || echo "")
+
+          echo "irsa_role_arn=${IRSA_ROLE_ARN}" >> "$GITHUB_OUTPUT"
+          echo "s3_bucket=${S3_BUCKET}"          >> "$GITHUB_OUTPUT"
+          echo "sns_topic_arn=${SNS_TOPIC_ARN}"  >> "$GITHUB_OUTPUT"
+          echo "account_id=${ACCOUNT_ID}"        >> "$GITHUB_OUTPUT"
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: "3.14.4"
+
+      - name: Add Dagster Helm repo
+        run: |
+          helm repo add dagster https://dagster-io.github.io/helm
+          helm repo update
+
+      # Resolve the image tag: use build output, or manual override, or 'latest'
+      - name: Resolve image tag
+        id: resolve-tag
+        run: |
+          TAG="${{ needs.build-push.outputs.image_tag }}"
+          if [[ -z "${TAG}" && "${{ github.event.inputs.image_tag }}" != "" ]]; then
+            TAG="${{ github.event.inputs.image_tag }}"
+          fi
+          TAG="${TAG:-latest}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Deploying image tag: ${TAG}"
+
+      # Fetch DB credentials from Secrets Manager at deploy time
+      - name: Fetch RDS credentials
+        id: rds-creds
+        run: |
+          SECRET=$(aws secretsmanager get-secret-value \
+            --secret-id "hydrosat-${{ env.ENVIRONMENT }}/rds/credentials" \
+            --query SecretString --output text)
+          echo "db_host=$(echo $SECRET | jq -r .host)"      >> "$GITHUB_OUTPUT"
+          echo "db_password=$(echo $SECRET | jq -r .password)" >> "$GITHUB_OUTPUT"
+          echo "::add-mask::$(echo $SECRET | jq -r .password)"  # Mask password in logs
+
+      - name: Pre-create DB credentials secret
+        run: |
+          # Create/update the K8s secret with the real RDS password before Helm
+          # installs it. Without this, Helm creates the secret with its own default
+          # value ('test') which causes Dagster to fail connecting to RDS.
+          kubectl create namespace dagster --dry-run=client -o yaml | kubectl apply -f -
+          kubectl create secret generic dagster-postgresql-secret \
+            --namespace dagster \
+            --from-literal=postgresql-password="${{ steps.rds-creds.outputs.db_password }}" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Scale down duplicate kube-system pods to free memory
+        run: |
+          kubectl scale deployment coredns -n kube-system --replicas=1 2>/dev/null || true
+          kubectl scale deployment ebs-csi-controller -n kube-system --replicas=1 2>/dev/null || true
+
+      - name: Helm upgrade Dagster
+        run: |
+          helm upgrade --install dagster dagster/dagster \
+            --namespace dagster \
+            --create-namespace \
+            --version "1.12.18" \
+            --values helm/dagster/values.yaml \
+            --set "dagster-user-deployments.deployments[0].image.tag=${{ steps.resolve-tag.outputs.tag }}" \
+            --set "dagster-user-deployments.deployments[0].image.repository=${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}" \
+            --set "dagster-user-deployments.deployments[0].env[4].name=DAGSTER_SNS_TOPIC_ARN" \
+            --set "dagster-user-deployments.deployments[0].env[4].value=${{ steps.infra-values.outputs.sns_topic_arn }}" \
+            --set "postgresql.postgresqlHost=${{ steps.rds-creds.outputs.db_host }}" \
+            --set "postgresql.postgresqlDatabase=dagster" \
+            --set "postgresql.postgresqlUsername=dagster" \
+            --set "postgresql.postgresqlPassword=${{ steps.rds-creds.outputs.db_password }}" \
+            --set "postgresql.existingSecret=dagster-postgresql-secret" \
+            --set "serviceAccount.annotations.eks\.amazonaws\.com/role-arn=${{ steps.infra-values.outputs.irsa_role_arn }}" \
+            --set "computeLogManager.config.s3ComputeLogManager.bucket=${{ steps.infra-values.outputs.s3_bucket }}" \
+            --disable-openapi-validation \
+            --no-hooks \
+            --timeout 20m \
+            --history-max 5
+
+      - name: Verify Dagster rollout
+        run: |
+          echo "Waiting for Dagster deployment to be ready..."
+          
+          # Check deployment status first
+          echo "━━━ Current deployment status ━━━"
+          kubectl get deployments -n dagster
+          
+          # Wait for rollouts with more time
+          kubectl rollout status deployment/dagster-dagster-webserver -n dagster --timeout=15m || true
+          kubectl rollout status deployment/dagster-dagster-daemon    -n dagster --timeout=15m || true
+          
+          echo "━━━ Pod status ━━━"
+          kubectl get pods -n dagster -o wide
+          
+          echo "━━━ Recent events ━━━"
+          kubectl get events -n dagster --sort-by='.lastTimestamp' --field-selector type!=Normal | tail -10
+          
+          echo "━━━ Checking for failed pods ━━━"
+          FAILED_PODS=$(kubectl get pods -n dagster --field-selector=status.phase=Failed -o name 2>/dev/null || true)
+          if [[ -n "$FAILED_PODS" ]]; then
+            echo "Found failed pods:"
+            kubectl get pods -n dagster --field-selector=status.phase=Failed
+            for pod in $FAILED_PODS; do
+              echo "━━━ Logs for $pod ━━━"
+              kubectl logs $pod -n dagster --previous=false --tail=50 || true
+            done
+          else
+            echo "No failed pods found"
+          fi
+          
+          echo "━━━ Checking pending pods ━━━" 
+          PENDING_PODS=$(kubectl get pods -n dagster --field-selector=status.phase=Pending -o name 2>/dev/null || true)
+          if [[ -n "$PENDING_PODS" ]]; then
+            echo "Found pending pods:"
+            for pod in $PENDING_PODS; do
+              echo "━━━ Describe $pod ━━━"
+              kubectl describe $pod -n dagster || true
+            done
+          fi
+
+  # ── Job 3: Deploy monitoring stack ───────────────────────────────────────
+  deploy-monitoring:
+    name: Deploy Monitoring (Helm)
+    runs-on: ubuntu-latest
+    needs: deploy-dagster
+    environment: ${{ (github.event_name == 'push' || github.event.inputs.environment == 'prod' || inputs.environment == 'prod') && 'production' || github.event.inputs.environment || inputs.environment || 'dev' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: github-actions-deploy-monitoring-${{ github.run_id }}
+
+      - name: Update kubeconfig
+        run: |
+          aws eks create-access-entry --cluster-name "${{ env.CLUSTER_NAME }}" \
+            --principal-arn "${{ secrets.AWS_ROLE_ARN }}" \
+            --region "${{ env.AWS_REGION }}" 2>/dev/null || true
+          aws eks associate-access-policy --cluster-name "${{ env.CLUSTER_NAME }}" \
+            --principal-arn "${{ secrets.AWS_ROLE_ARN }}" \
+            --policy-arn arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy \
+            --access-scope type=cluster --region "${{ env.AWS_REGION }}" 2>/dev/null || true
+          aws eks update-kubeconfig \
+            --region "${{ env.AWS_REGION }}" \
+            --name "${{ env.CLUSTER_NAME }}"
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: "3.14.4"
+
+      - name: Add Prometheus community repo
+        run: |
+          helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+          helm repo update
+
+      - name: Write monitoring overrides
+        run: |
+          cat > monitoring-overrides.yaml <<EOF
+          alertmanager:
+            config:
+              receivers:
+                - name: "slack-oncall"
+                  slack_configs:
+                    - api_url: "${{ secrets.SLACK_WEBHOOK_URL }}"
+                      channel: "#dagster-alerts"
+                      username: "Dagster AlertBot"
+                      icon_emoji: ":fire:"
+                      send_resolved: true
+                - name: "null"
+          EOF
+
+      - name: Helm upgrade monitoring
+        run: |
+          kubectl create namespace monitoring --dry-run=client -o yaml | kubectl apply -f -
+          helm upgrade --install kube-prometheus-stack prometheus-community/kube-prometheus-stack \
+            --namespace monitoring \
+            --create-namespace \
+            --version "58.0.0" \
+            --values helm/monitoring/values.yaml \
+            --values monitoring-overrides.yaml \
+            --timeout 20m \
+            --wait
+
+      - name: Apply monitoring manifests
+        run: kubectl apply -f kubernetes/monitoring/
+
+      - name: Verify monitoring rollout
+        run: |
+          kubectl rollout status deployment/kube-prometheus-stack-operator -n monitoring --timeout=10m
+          kubectl rollout status deployment/kube-prometheus-stack-grafana -n monitoring --timeout=10m
+
+  # ── Job 4: Smoke test ─────────────────────────────────────────────────────
+  smoke-test:
+    name: Smoke Test
+    runs-on: ubuntu-latest
+    needs: [deploy-dagster, deploy-monitoring]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: github-actions-smoke-${{ github.run_id }}
+
+      - name: Update kubeconfig
+        run: |
+          aws eks create-access-entry --cluster-name "${{ env.CLUSTER_NAME }}" \
+            --principal-arn "${{ secrets.AWS_ROLE_ARN }}" \
+            --region "${{ env.AWS_REGION }}" 2>/dev/null || true
+          aws eks associate-access-policy --cluster-name "${{ env.CLUSTER_NAME }}" \
+            --principal-arn "${{ secrets.AWS_ROLE_ARN }}" \
+            --policy-arn arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy \
+            --access-scope type=cluster --region "${{ env.AWS_REGION }}" 2>/dev/null || true
+          aws eks update-kubeconfig \
+            --region "${{ env.AWS_REGION }}" \
+            --name "${{ env.CLUSTER_NAME }}"
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: "3.14.4"
+
+      - name: Add Dagster Helm repo
+        run: |
+          helm repo add dagster https://dagster-io.github.io/helm
+          helm repo update
+
+      - name: Wait for Dagit ALB to be ready
+        id: wait-alb
+        run: |
+          # Debug: Check if AWS LBC is running first
+          echo "━━━ Checking AWS Load Balancer Controller ━━━"
+          kubectl get pods -n kube-system -l app.kubernetes.io/name=aws-load-balancer-controller || true
+
+          # Debug: Check if ingresses exist
+          echo "━━━ Checking all ingresses in dagster namespace ━━━"
+          kubectl get ingresses -n dagster -o wide || true
+
+          # Debug: Check services
+          echo "━━━ Checking services in dagster namespace ━━━"
+          kubectl get svc -n dagster || true
+
+          # Debug: Show Helm release info
+          echo "━━━ Checking Helm release ━━━"
+          helm list -n dagster || true
+          helm get values dagster -n dagster || true
+
+          # Wait for ALB hostname — initialize local var so the post-loop check works
+          # (GITHUB_ENV writes only take effect in subsequent steps, not this shell)
+          DAGIT_URL=""
+          for i in $(seq 1 20); do
+            HOSTNAME=$(kubectl get ingress -n dagster -o jsonpath='{.items[0].status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
+            if [[ -n "${HOSTNAME}" ]]; then
+              echo "ALB hostname: ${HOSTNAME}"
+              DAGIT_URL="http://${HOSTNAME}"
+              echo "DAGIT_URL=${DAGIT_URL}" >> "$GITHUB_ENV"
+              echo "dagit_url=${DAGIT_URL}" >> "$GITHUB_OUTPUT"
+              break
+            fi
+
+            # Show current ingress status
+            echo "━━━ Attempt ${i}/20 - Current ingress status ━━━"
+            kubectl get ingresses -n dagster -o yaml || true
+
+            echo "Waiting for ALB... (attempt ${i}/20)"
+            sleep 30
+          done
+
+          if [[ -z "${DAGIT_URL}" ]]; then
+            echo "::error::ALB hostname not assigned after 10 minutes"
+            echo "━━━ Final debugging info ━━━"
+            kubectl describe ingress -n dagster || true
+            kubectl get events -n dagster --sort-by='.lastTimestamp' | tail -20 || true
+            exit 1
+          fi
+
+      # Inject DAGIT_URL into user code server so sensors can build clickable run links.
+      # This must happen after ALB hostname is known — Terraform cannot know it at apply time.
+      # Use kubectl set env instead of helm upgrade to avoid Helm schema validation errors
+      # that occur when --set array[n].value= is used without full object context.
+      - name: Inject DAGIT_URL into user deployment
+        run: |
+          kubectl set env deployment/dagster-dagster-user-deployments-hydrosat-pipeline \
+            DAGIT_URL="${{ steps.wait-alb.outputs.dagit_url }}" \
+            -n dagster
+          kubectl rollout status deployment/dagster-dagster-user-deployments-hydrosat-pipeline -n dagster --timeout=5m || true
+
+      - name: Test Dagit health endpoint
+        run: |
+          # ALB target registration takes 1-3 min after pods are Ready.
+          # 24 attempts x 15s = 6 minutes max wait.
+          for i in $(seq 1 24); do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+              --connect-timeout 10 \
+              "${DAGIT_URL}/server_info" || echo "000")
+            echo "Health check attempt ${i}: HTTP ${STATUS}"
+            if [[ "${STATUS}" == "200" ]]; then
+              echo "✅ Dagit is healthy"
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "❌ Dagit health check failed after 6 minutes"
+          exit 1
+
+      - name: Test Dagster GraphQL API
+        run: |
+          RESPONSE=$(curl -s -X POST \
+            -H "Content-Type: application/json" \
+            -d '{"query": "{ version }"}' \
+            "${DAGIT_URL}/graphql")
+          echo "GraphQL response: ${RESPONSE}"
+          echo "${RESPONSE}" | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          assert 'data' in data, f'Missing data key: {data}'
+          assert 'version' in data['data'], f'Missing version: {data}'
+          print(f'✅ Dagster version: {data[\"data\"][\"version\"]}')
+          "
+
+      - name: Verify Prometheus API
+        run: |
+          kubectl port-forward svc/kube-prometheus-stack-prometheus 9090:9090 -n monitoring >/tmp/prometheus-port-forward.log 2>&1 &
+          PF_PID=$!
+          trap 'kill ${PF_PID} 2>/dev/null || true' EXIT
+
+          for i in $(seq 1 20); do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:9090/-/ready || echo "000")
+            echo "Prometheus readiness attempt ${i}: HTTP ${STATUS}"
+            if [[ "${STATUS}" == "200" ]]; then
+              break
+            fi
+            sleep 5
+          done
+
+          curl -fsS http://127.0.0.1:9090/api/v1/query?query=up >/tmp/prometheus-up.json
+          python3 - <<'PY'
+          import json
+          with open('/tmp/prometheus-up.json') as fh:
+              data = json.load(fh)
+          assert data.get('status') == 'success', data
+          print('✅ Prometheus API reachable')
+          PY
+
+      # ── Notify ────────────────────────────────────────────────────────────
+      - name: Notify Slack
+        if: always()
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
+          STATUS: ${{ job.status }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ "$STATUS" = "success" ]; then
+            TEXT="✅ *Dagster deployed* — \`${{ env.ENVIRONMENT }}\`"
+            COLOR="good"
+          else
+            TEXT="❌ *Dagster deployment FAILED* — \`${{ env.ENVIRONMENT }}\`"
+            COLOR="danger"
+          fi
+          curl -s -X POST "$SLACK_WEBHOOK" \
+            -H 'Content-type: application/json' \
+            --data "{\"attachments\":[{\"color\":\"$COLOR\",\"text\":\"$TEXT\",\"fields\":[{\"title\":\"Run\",\"value\":\"<$RUN_URL|${{ github.run_id }}>\",\"short\":true},{\"title\":\"Actor\",\"value\":\"${{ github.actor }}\",\"short\":true}]}]}"

@@ -1,0 +1,233 @@
+# Dagster Helm Chart Values
+# Chart: dagster/dagster v1.9.x
+# Docs: https://docs.dagster.io/deployment/guides/kubernetes/deploying-with-helm
+
+############################
+# Global settings
+############################
+global:
+  # Service account — workload identity for Dagster pods
+  serviceAccountName: "dagster"
+
+############################
+# Telemetry — disable to prevent PermissionError on /opt/dagster/.dagster in run pods
+############################
+telemetry:
+  enabled: false
+
+############################
+# Dagster Webserver (Dagit)
+############################
+dagsterWebserver:
+  replicaCount: 2
+
+  # RDS requires SSL — PGSSLMODE ensures the PostgreSQL client connects with TLS
+  env:
+    - name: PGSSLMODE
+      value: "require"
+
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "256Mi"
+    limits:
+      cpu: "500m"
+      memory: "512Mi"
+
+  # Tolerate system node taint so the webserver lands on system nodes
+  tolerations:
+    - key: "role"
+      operator: "Equal"
+      value: "system"
+      effect: "NoSchedule"
+
+  nodeSelector:
+    role: "system"
+
+  # Pod annotations for prometheus scraping
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "3000"
+    prometheus.io/path: "/metrics"
+
+############################
+# Ingress - Global level for v1.12.18
+############################
+ingress:
+  enabled: true
+  ingressClassName: "alb"
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}]'
+    alb.ingress.kubernetes.io/healthcheck-path: /server_info
+  dagsterWebserver:
+    host: ""   # Leave blank — ALB DNS name is used
+    path: /
+    pathType: Prefix
+    prometheus.io/port: "3000"
+    prometheus.io/path: "/metrics"
+
+############################
+# Dagster Daemon
+############################
+dagsterDaemon:
+  enabled: true
+
+  env:
+    - name: PGSSLMODE
+      value: "require"
+
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "128Mi"
+    limits:
+      cpu: "500m"
+      memory: "256Mi"
+
+  tolerations:
+    - key: "role"
+      operator: "Equal"
+      value: "system"
+      effect: "NoSchedule"
+
+  nodeSelector:
+    role: "system"
+
+  # Heartbeat sensor — alert if daemon stops running
+  heartbeatTolerance: 300  # seconds
+
+############################
+# Run Launcher: Kubernetes executor
+############################
+runLauncher:
+  type: K8sRunLauncher
+
+  config:
+    k8sRunLauncher:
+      # Dagster run pods land on worker (spot) nodes
+      envConfigMaps: []
+      envSecrets: []
+      imagePullPolicy: IfNotPresent
+      jobNamespace: "dagster"
+
+      # Worker node tolerations so run pods can schedule on spot workers
+      runK8sConfig:
+        containerConfig:
+          env:
+            - name: DAGSTER_DISABLE_TELEMETRY
+              value: "true"
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "1000m"
+              memory: "1Gi"
+        podSpecConfig:
+          tolerations: []
+          nodeSelector:
+            role: worker
+
+############################
+# PostgreSQL — external RDS
+############################
+postgresql:
+  # Disable the bundled PostgreSQL chart; use external RDS
+  enabled: false
+
+  # These values are set via Terraform helm_release set{} blocks
+  postgresqlHost: ""       # injected by Terraform
+  postgresqlDatabase: ""   # injected by Terraform
+  postgresqlUsername: ""   # injected by Terraform
+  postgresqlPort: 5432
+
+  # Reference the Kubernetes secret created by Terraform
+  existingSecret: "dagster-postgresql-secret"
+  existingSecretKey: "postgresql-password"
+
+############################
+# Pipeline code image
+# IMPORTANT: key must be "dagster-user-deployments" (hyphenated) — this is the Helm subchart
+# name. Using "dagsterUserDeployments" (camelCase) is silently ignored by the subchart.
+############################
+dagster-user-deployments:
+  enabled: true
+  deployments:
+    - name: "hydrosat-pipeline"
+      image:
+        repository: "hydrosat/dagster-pipeline"
+        tag: "latest"
+        pullPolicy: Always
+
+      dagsterApiGrpcArgs:
+        - "-m"
+        - "pipeline"
+
+      port: 3030
+
+      resources:
+        requests:
+          cpu: "100m"
+          memory: "128Mi"
+        limits:
+          cpu: "500m"
+          memory: "512Mi"
+
+      # Can run on either system or worker nodes
+      tolerations:
+        - key: "role"
+          operator: "Equal"
+          value: "system"
+          effect: "NoSchedule"
+
+      nodeSelector:
+        role: "system"
+
+      # Environment variables for the pipeline
+      env:
+        - name: PGSSLMODE
+          value: "require"
+        - name: DAGSTER_POSTGRES_DB
+          value: "dagster"
+        - name: ENVIRONMENT
+          value: "prod"
+        # DAGIT_URL is set by CI after ALB is provisioned.
+        # Sensors use this to construct clickable run URLs in alert messages.
+        - name: DAGIT_URL
+          value: ""   # overridden by CI via --set
+        - name: DAGSTER_SNS_TOPIC_ARN  # overridden by CI after Terraform apply
+          value: ""
+
+      envSecrets:
+        - name: "dagster-postgresql-secret"
+
+      # Prometheus metrics annotations (moved to deployment level)
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "3030"
+
+############################
+# Compute log storage
+############################
+computeLogManager:
+  type: S3ComputeLogManager
+  config:
+    s3ComputeLogManager:
+      # Bucket name is injected by Terraform via helm_release set{} — do not hardcode.
+      # Terraform sets: computeLogManager.config.s3ComputeLogManager.bucket
+      bucket: ""       # overridden by Terraform
+      prefix: "compute-logs"   # must match dagster.yaml prefix
+
+############################
+# Service Account
+############################
+serviceAccount:
+  create: true
+  name: "dagster"
+  annotations:
+    # IRSA role ARN is injected by Terraform via helm_release set{}.
+    # Grants S3 compute log write access and SNS publish for failure alerts.
+    # Terraform sets: serviceAccount.annotations.eks\.amazonaws\.com/role-arn
+    eks.amazonaws.com/role-arn: ""   # overridden by Terraform

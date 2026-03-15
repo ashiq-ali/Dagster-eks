@@ -1,0 +1,15 @@
+# Prometheus scrape config for local Docker Compose stack
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: "dagster_webserver"
+    static_configs:
+      - targets: ["dagster_webserver:3000"]
+    metrics_path: /metrics
+
+  - job_name: "dagster_code_server"
+    static_configs:
+      - targets: ["dagster_code:3030"]
+    metrics_path: /metrics

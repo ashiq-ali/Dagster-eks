@@ -1,0 +1,88 @@
+# ── Terraform ─────────────────────────────────────────────────────────────────
+**/.terraform/
+**/.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+*.tfplan
+tfplan
+terraform.tfvars
+!terraform.tfvars.example
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.venv/
+venv/
+env/
+ENV/
+.Python
+pip-log.txt
+pip-delete-this-directory.txt
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+*.log
+
+# ── Dagster ───────────────────────────────────────────────────────────────────
+$DAGSTER_HOME/
+dagster_home/
+logs/
+storage/
+history/
+.dagster/
+
+# ── Docker ────────────────────────────────────────────────────────────────────
+.dockerignore
+
+# ── Helm ──────────────────────────────────────────────────────────────────────
+charts/
+*.tgz
+
+# ── Kubernetes secrets ────────────────────────────────────────────────────────
+*-secret.yaml
+*-secrets.yaml
+!*-secret-template.yaml
+kubeconfig
+.kube/
+
+# ── AWS / Cloud ───────────────────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials
+aws-credentials
+
+# ── OS / Editor ───────────────────────────────────────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ── Diagrams output ───────────────────────────────────────────────────────────
+# (committed as needed — not auto-generated in CI)

@@ -1,0 +1,101 @@
+# Standalone PrometheusRule CRD manifest (complements the rules embedded in Helm values)
+# Deploy: kubectl apply -f kubernetes/monitoring/prometheus-rules.yaml
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: dagster-slo-rules
+  namespace: monitoring
+  labels:
+    # Must match kube-prometheus-stack's ruleSelector labels
+    release: kube-prometheus-stack
+    app: kube-prometheus-stack
+spec:
+  groups:
+    # ── SLO: Pipeline Success Rate ────────────────────────────────────────────
+    - name: dagster.slo
+      interval: 60s
+      rules:
+        # 5-minute success rate (burns down alert)
+        - record: dagster:job_success_rate:5m
+          expr: |
+            (
+              rate(dagster_run_success_total[5m])
+              /
+              (rate(dagster_run_success_total[5m]) + rate(dagster_run_failure_total[5m]) + 1e-10)
+            )
+
+        # 1-hour success rate for SLO tracking
+        - record: dagster:job_success_rate:1h
+          expr: |
+            (
+              rate(dagster_run_success_total[1h])
+              /
+              (rate(dagster_run_success_total[1h]) + rate(dagster_run_failure_total[1h]) + 1e-10)
+            )
+
+        # SLO breach: success rate < 95 % over 1 hour
+        - alert: DagsterSLOBreach
+          expr: dagster:job_success_rate:1h < 0.95
+          for: 5m
+          labels:
+            severity: critical
+            team: data-platform
+            slo: pipeline_success_rate
+          annotations:
+            summary: "Dagster pipeline SLO breach — success rate below 95 %"
+            description: |
+              Pipeline success rate over the last hour is {{ $value | humanizePercentage }}.
+              SLO target is 95 %. Immediate investigation required.
+            runbook: "https://wiki.hydrosat.com/runbooks/dagster-slo-breach"
+
+    # ── Alert: Dagster Exporter / Metrics Endpoint Down ───────────────────────
+    - name: dagster.exporter
+      interval: 60s
+      rules:
+        - alert: DagsterMetricsEndpointDown
+          expr: |
+            absent(up{job="dagster"}) == 1
+          for: 3m
+          labels:
+            severity: warning
+            team: data-platform
+          annotations:
+            summary: "Dagster metrics endpoint is unreachable"
+            description: |
+              Prometheus cannot scrape Dagster metrics. The /metrics endpoint
+              on the Dagster webserver or user-deployments pod is down.
+              Check pod status: kubectl get pods -n dagster
+
+    # ── Alert: K8s Run Pod Crash ──────────────────────────────────────────────
+    - name: dagster.run_pods
+      interval: 60s
+      rules:
+        - alert: DagsterRunPodCrashLooping
+          expr: |
+            rate(kube_pod_container_status_restarts_total{
+              namespace="dagster"
+            }[5m]) > 0.5
+          for: 5m
+          labels:
+            severity: warning
+            team: data-platform
+          annotations:
+            summary: "Dagster run pod is crash-looping"
+            description: |
+              Pod {{ $labels.pod }} in namespace {{ $labels.namespace }} is restarting
+              frequently ({{ $value | humanize }} restarts/s).
+              Check logs: kubectl logs -n dagster {{ $labels.pod }} --previous
+
+        - alert: DagsterRunPodPending
+          expr: |
+            kube_pod_status_phase{namespace="dagster", phase="Pending"} == 1
+          for: 10m
+          labels:
+            severity: warning
+            team: data-platform
+          annotations:
+            summary: "Dagster run pod stuck in Pending state"
+            description: |
+              Pod {{ $labels.pod }} has been Pending for >10 minutes.
+              Check cluster autoscaler logs or node capacity:
+              kubectl describe pod -n dagster {{ $labels.pod }}

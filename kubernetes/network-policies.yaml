@@ -1,0 +1,215 @@
+# Network Policies — dagster namespace
+#
+# Default stance: deny all ingress and egress, then explicitly allow only what
+# is needed. This prevents:
+#   - Run pods (arbitrary user code) reaching the metadata DB directly
+#   - Lateral movement between Dagster components and the monitoring stack
+#   - Data exfiltration from worker pods (only S3/SNS egress allowed)
+#
+# Apply: kubectl apply -f kubernetes/network-policies.yaml
+
+---
+# ── 1. Default deny all ingress in dagster namespace ─────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: dagster
+spec:
+  podSelector: {}   # applies to all pods in namespace
+  policyTypes:
+    - Ingress
+
+---
+# ── 2. Default deny all egress in dagster namespace ──────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-egress
+  namespace: dagster
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+
+---
+# ── 3. Allow DNS resolution for all pods ─────────────────────────────────────
+# kube-dns runs in kube-system on UDP/TCP 53. Without this no hostname resolves.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  namespace: dagster
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+
+---
+# ── 4. Webserver: allow ingress from ALB (any IP — ALB is outside cluster) ───
+# The ALB health-checks and forwards traffic from any source IP.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-alb-to-webserver
+  namespace: dagster
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: dagster-webserver
+  policyTypes:
+    - Ingress
+  ingress:
+    - ports:
+        - port: 3000
+          protocol: TCP
+
+---
+# ── 5. Webserver + daemon: allow egress to code server (gRPC :3030) ──────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-control-plane-to-code-server
+  namespace: dagster
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app.kubernetes.io/name
+        operator: In
+        values:
+          - dagster-webserver
+          - dagster-daemon
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: dagster-user-deployments
+      ports:
+        - port: 3030
+          protocol: TCP
+
+---
+# ── 6. Code server: allow ingress from webserver + daemon ────────────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-control-plane-ingress-to-code-server
+  namespace: dagster
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: dagster-user-deployments
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchExpressions:
+              - key: app.kubernetes.io/name
+                operator: In
+                values:
+                  - dagster-webserver
+                  - dagster-daemon
+      ports:
+        - port: 3030
+          protocol: TCP
+
+---
+# ── 7. Webserver + daemon: allow egress to RDS PostgreSQL (:5432) ─────────────
+# Run pods (Dagster K8s executor) connect through the daemon, NOT directly to RDS.
+# This policy intentionally excludes run-pod label selectors.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dagster-control-plane-to-rds
+  namespace: dagster
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app.kubernetes.io/name
+        operator: In
+        values:
+          - dagster-webserver
+          - dagster-daemon
+  policyTypes:
+    - Egress
+  egress:
+    - ports:
+        - port: 5432
+          protocol: TCP
+
+---
+# ── 8. Run pods: allow egress to S3 and SNS via HTTPS only ───────────────────
+# Dagster K8s executor creates pods with the label dagster/run_id.
+# These can write to S3 (compute logs, pipeline output) and publish to SNS.
+# They CANNOT reach RDS, the code server, or the webserver directly.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-run-pods-aws-egress
+  namespace: dagster
+spec:
+  podSelector:
+    matchExpressions:
+      - key: dagster/run_id
+        operator: Exists
+  policyTypes:
+    - Egress
+  egress:
+    - ports:
+        - port: 443
+          protocol: TCP   # S3, SNS, ECR, STS — all over HTTPS
+
+---
+# ── 9. Prometheus scraping: allow ingress from monitoring namespace ────────────
+# Prometheus in the monitoring namespace scrapes :3000 (webserver) and :3030 (code server).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-prometheus-scrape
+  namespace: dagster
+spec:
+  podSelector: {}   # all pods with prometheus.io/scrape: "true" annotations
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - port: 3000
+          protocol: TCP
+        - port: 3030
+          protocol: TCP
+
+---
+# ── 10. Webserver + daemon: allow HTTPS egress for ECR image pulls + AWS APIs ──
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-control-plane-aws-egress
+  namespace: dagster
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app.kubernetes.io/name
+        operator: In
+        values:
+          - dagster-webserver
+          - dagster-daemon
+          - dagster-user-deployments
+  policyTypes:
+    - Egress
+  egress:
+    - ports:
+        - port: 443
+          protocol: TCP   # ECR, S3, Secrets Manager, STS, SNS
